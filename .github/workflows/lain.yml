@@ -1,0 +1,248 @@
+name: Eden Android - Floating Pause/Resume Button
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: "Product flavor ('genshinSpoof' = the 'Eden Optimized' build)"
+        required: true
+        default: "genshinSpoof"
+        type: choice
+        options:
+          - genshinSpoof
+          - mainline
+          - legacy
+      nightly:
+        description: 'Build as Nightly (app name gets " Nightly" suffix)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  EDEN_REPO: https://github.com/eden-emulator/mirror.git
+  EDEN_COMMIT: 37fe9119526c03ca064166130cc983c55b9a9e86
+
+jobs:
+  build-eden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/share/powershell /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Clone Eden at pinned commit
+        run: |
+          git clone "$EDEN_REPO" eden
+          cd eden
+          git checkout "$EDEN_COMMIT"
+          git submodule update --init --recursive
+          git rev-parse HEAD
+
+      - name: Patch Eden - floating pause/resume button
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          root = pathlib.Path("eden")
+          activity = root / "src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt"
+          layout = root / "src/android/app/src/main/res/layout/activity_emulation.xml"
+
+          # ---- Patch 1: rewrite activity_emulation.xml ----
+          layout.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout
+              xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:id="@+id/emulation_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:keepScreenOn="true">
+
+              <androidx.fragment.app.FragmentContainerView
+                  android:id="@+id/fragment_container"
+                  android:name="androidx.navigation.fragment.NavHostFragment"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  app:defaultNavHost="true" />
+
+              <com.google.android.material.floatingactionbutton.FloatingActionButton
+                  android:id="@+id/fab_pause_resume"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="bottom|end"
+                  android:layout_margin="16dp"
+                  android:contentDescription="@string/pause"
+                  android:src="@drawable/ic_pause"
+                  android:visibility="gone"
+                  app:fabSize="mini" />
+          </FrameLayout>
+          """ + "\n")
+          print("patched:", layout)
+
+          # ---- Patch 2: EmulationActivity.kt ----
+          src = activity.read_text()
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  sys.exit(f"PATCH FAILED - anchor not unique/found ({count}x): {label}")
+              return text.replace(old, new, 1)
+
+          # (0) Add missing imports
+          src = replace_once(
+              src,
+              "package org.yuzu.yuzu_emu.activities",
+              "package org.yuzu.yuzu_emu.activities\n\nimport android.graphics.Rect\nimport android.view.View\nimport kotlin.math.roundToInt",
+              "imports",
+          )
+
+          # (a) wire up the button right after setContentView
+          src = replace_once(
+              src,
+              "setContentView(binding.root)",
+              "setContentView(binding.root)\n                    setupPauseResumeButton()",
+              "onCreate/setContentView",
+          )
+
+          # (b) helper methods, inserted before enableFullscreenImmersive
+          helpers = """    private fun setupPauseResumeButton() {
+                  binding.fabPauseResume.setOnClickListener {
+                      if (!NativeLibrary.isRunning()) {
+                          return@setOnClickListener
+                      }
+                      if (NativeLibrary.isPaused()) {
+                          NativeLibrary.unpauseEmulation()
+                      } else {
+                          NativeLibrary.pauseEmulation()
+                      }
+                      updatePauseResumeButtonIcon()
+                  }
+                  updatePauseResumeButtonIcon()
+              }
+
+              private fun updatePauseResumeButtonIcon() {
+                  binding.fabPauseResume.setImageResource(
+                      if (NativeLibrary.isPaused()) R.drawable.ic_play else R.drawable.ic_pause
+                  )
+              }
+
+              private fun isTouchOnPauseResumeButton(event: MotionEvent): Boolean {
+                  if (binding.fabPauseResume.visibility != View.VISIBLE) {
+                      return false
+                  }
+                  val buttonBounds = Rect()
+                  binding.fabPauseResume.getGlobalVisibleRect(buttonBounds)
+                  return buttonBounds.contains(event.x.roundToInt(), event.y.roundToInt())
+              }
+
+              private fun enableFullscreenImmersive() {"""
+          src = replace_once(
+              src,
+              "private fun enableFullscreenImmersive() {",
+              helpers,
+              "enableFullscreenImmersive anchor",
+          )
+
+          # (c) keep icon in sync when onResume runs
+          src = replace_once(
+              src,
+              "nfcReader.startScanning()",
+              "updatePauseResumeButtonIcon()\n                    nfcReader.startScanning()",
+              "onResume",
+          )
+
+          # (d) show the button once emulation starts
+          src = replace_once(
+              src,
+              "NativeLibrary.playTimeManagerStart()",
+              "NativeLibrary.playTimeManagerStart()\n\n                  binding.fabPauseResume.visibility = View.VISIBLE\n                  updatePauseResumeButtonIcon()",
+              "onEmulationStarted",
+          )
+
+          # (e) hide the button when emulation stops
+          src = replace_once(
+              src,
+              "emulationViewModel.setEmulationStopped(true)",
+              "emulationViewModel.setEmulationStopped(true)\n                  binding.fabPauseResume.visibility = View.GONE",
+              "onEmulationStopped",
+          )
+
+          # (f) ignore touches on the button
+          src = replace_once(
+              src,
+              "MotionEvent.ACTION_DOWN -> {",
+              "val touchOnPauseResumeButton = isTouchOnPauseResumeButton(event)\n\n                          MotionEvent.ACTION_DOWN -> {\n                              if (touchOnPauseResumeButton) return@let",
+              "dispatchTouchEvent ACTION_DOWN",
+          )
+          src = replace_once(
+              src,
+              "MotionEvent.ACTION_UP -> {",
+              "MotionEvent.ACTION_UP -> {\n                              if (touchOnPauseResumeButton) return@let\n                              if (!emulationViewModel.drawerOpen.value) {",
+              "dispatchTouchEvent ACTION_UP",
+          )
+
+          activity.write_text(src)
+          print("patched:", activity)
+          print("PATCH OK")
+          PY
+
+      - name: Show patch summary
+        run: |
+          grep -n "fabPauseResume\|setupPauseResumeButton\|isTouchOnPauseResumeButton" \
+            eden/src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358" \
+            "cmake;3.31.6"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Gradle settings
+        run: |
+          mkdir -p "$HOME/.gradle"
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx8g -XX:+UseParallelGC' \
+            'org.gradle.daemon=false' \
+            'org.gradle.caching=true' \
+            > "$HOME/.gradle/gradle.properties"
+
+      - name: Build optimized APK
+        working-directory: eden/src/android
+        run: |
+          FLAVOR_CAP="$(echo '${{ inputs.flavor }}' | sed 's/^\(.\)/\U\1/')"
+          NIGHTLY_FLG=""
+          if [ "${{ inputs.nightly }}" = "true" ]; then
+            NIGHTLY_FLG="-Pnightly=true"
+          fi
+          chmod +x gradlew
+          ./gradlew --console=plain --stacktrace \
+            ":app:assemble${FLAVOR_CAP}Release" ${NIGHTLY_FLG}
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK="$(find eden/src/android/app/build/outputs/apk -name '*.apk' | head -n1)"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-${{ inputs.flavor }}-release-floating-pause
+          path: ${{ steps.apk.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
